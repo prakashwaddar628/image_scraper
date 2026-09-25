@@ -33,6 +33,14 @@ USER_AGENTS = [
 
 # Order in which sources are tried for each item. Comment one out to disable it.
 # "bing" is the most reliable/least likely to block; amazon/flipkart are best-effort.
+# Only list sources that have a matching scrapers/<name>.py module with a
+# search_candidates() function — anything else is skipped with a warning at
+# runtime (see main.py). "duckduckgo" is deliberately left OUT of this list:
+# it's used as the tier-3 web fallback (see the Fallback tiers section below),
+# not as a strict source, so listing it here would just make tier 1 try it
+# twice. google/bigbasket/jiomart/blinkit/swiggy/zeptonow/dunzo have Referer
+# entries below as placeholders for future scrapers, but no module yet —
+# add them here once scrapers/<name>.py exists for each.
 SOURCES_ORDER = ["flipkart", "amazon", "bing"]
 
 # Minimum acceptable downloaded image size in bytes (filters out 1x1 tracking pixels / broken icons)
@@ -57,6 +65,7 @@ REFERERS = {
     "amazon": "https://www.amazon.in/",
     "bing": "https://www.bing.com/",
     "google": "https://www.google.com/",
+    "duckduckgo": "https://duckduckgo.com/",
     "bigbasket": "https://www.bigbasket.com/",
     "jiomart": "https://www.jiomart.com/",
     "blinkit": "https://www.blinkit.com/",
@@ -64,3 +73,24 @@ REFERERS = {
     "zeptonow": "https://www.zepto.com/",
     "dunzo": "https://www.dunzo.com/",
 }
+
+# --- Fallback tiers (added to stop items failing outright) -----------------
+#
+# process_item() in main.py now runs THREE tiers per item instead of one:
+#
+#   1. Strict pass  — SOURCES_ORDER, each candidate must clear MIN_MATCH_SCORE.
+#   2. Relaxed pass — re-ranks the SAME already-fetched candidates from tier 1
+#      against RELAXED_MATCH_SCORE (no extra requests). Catches near-misses
+#      that were filtered out only because the threshold was strict.
+#   3. Web fallback — only if tiers 1 and 2 found nothing: a broad,
+#      unrestricted DuckDuckGo image search (scrapers/duckduckgo.py), judged
+#      against WEB_FALLBACK_MATCH_SCORE. Logged with confidence="web_fallback"
+#      so these are easy to filter out of _progress.csv and spot-check.
+#
+# Set ENABLE_RELAXED_RETRY / ENABLE_WEB_FALLBACK to False to disable a tier.
+
+ENABLE_RELAXED_RETRY = True
+RELAXED_MATCH_SCORE = 0.15  # lower bar for tier 2 (reused candidates, no brand hard-filter recommended)
+
+ENABLE_WEB_FALLBACK = True
+WEB_FALLBACK_MATCH_SCORE = 0.15  # lower bar for tier 3 (open web, no domain restriction)

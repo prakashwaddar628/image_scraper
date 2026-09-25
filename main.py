@@ -37,7 +37,7 @@ import pandas as pd
 import requests
 
 import config
-from scrapers import flipkart, amazon, bing_images
+from scrapers import flipkart, amazon, bing_images, duckduckgo
 from scrapers.matching import ranked_candidates
 
 logging.basicConfig(
@@ -47,13 +47,20 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# "duckduckgo" is deliberately NOT in config.SOURCES_ORDER — it's tier 3
+# (web fallback), only ever called after every configured source has failed
+# at both the strict and relaxed thresholds. See process_item().
 SOURCE_FUNCTIONS = {
     "flipkart": flipkart.search_candidates,
     "amazon": amazon.search_candidates,
     "bing": bing_images.search_candidates,
+    "duckduckgo": duckduckgo.search_candidates,
 }
 
-PROGRESS_HEADER = ["barcode", "category", "item", "status", "source", "match_score", "matched_title", "file", "error"]
+PROGRESS_HEADER = [
+    "barcode", "category", "item", "status", "confidence", "source",
+    "match_score", "matched_title", "file", "error",
+]
 
 INVALID_FILENAME_CHARS = '<>:"/\\|?*'
 
@@ -134,22 +141,63 @@ def _extension_from_content_type(content_type: str):
     return None
 
 
+def _try_download_ranked(ranked, cat_dir_stub, referer, max_attempts):
+    """Attempt to download the top `max_attempts` ranked candidates in score
+    order. Returns (dest_path, matched_title, score) on the first success,
+    or (None, None, None) plus the last error string if all fail."""
+    last_error = None
+    for image_url, matched_title, score in ranked[:max_attempts]:
+        try:
+            saved_path = download_image(image_url, cat_dir_stub, referer=referer)
+            return saved_path, matched_title, score, None
+        except Exception as e:
+            last_error = f"download failed: {e}"
+    return None, None, None, last_error
+
+
 def process_item(category: str, item_name: str, barcode: str, cat_dir: Path, delay: float) -> dict:
     """
-    Tries each source in order. For each source, fetches several candidate
-    images (not just the first result), ranks every candidate that passes
-    matching.py's brand + keyword checks, and attempts to download the
-    top few in score order — falling through to the next candidate if one
-    fails to download (dead link, hotlink-blocked, etc.) before giving up on
-    that source entirely. Only moves to the next source if nothing from this
-    one both matched AND downloaded successfully.
+    Runs up to three fallback tiers per item so a single strict miss doesn't
+    sink the item outright:
+
+      Tier 1 — strict: try each source in SOURCES_ORDER, each candidate must
+        clear config.MIN_MATCH_SCORE. This is unchanged from before.
+
+      Tier 2 — relaxed retry: if tier 1 found nothing, re-rank the SAME
+        candidates already fetched in tier 1 (no extra network calls) against
+        config.RELAXED_MATCH_SCORE. This catches near-misses that were only
+        filtered out because the strict threshold was strict, not because no
+        plausible image existed at all.
+
+      Tier 3 — web fallback: if tiers 1 and 2 both found nothing, run a
+        broad, unrestricted DuckDuckGo image search (not limited to any
+        retailer domain) as a last resort, judged against
+        config.WEB_FALLBACK_MATCH_SCORE.
+
+    Every candidate that passes matching.py's brand + keyword checks is
+    still validated the same way each tier just uses a different bar for
+    "good enough" — and the result's `confidence` field records which tier
+    produced it, so you can filter/spot-check web_fallback rows separately
+    in _progress.csv.
     """
     safe_name = sanitize_filename(item_name)
     dest_stub = cat_dir / f"{safe_name}_{barcode}"
     last_error = "no confidently-matching image found from any source"
 
+    # Cache tier-1 candidates per source so tier 2 can re-rank them without
+    # re-hitting the network.
+    fetched_candidates = {}
+
+    # ---- Tier 1: strict pass over configured sources -----------------
     for source in config.SOURCES_ORDER:
-        search_fn = SOURCE_FUNCTIONS[source]
+        search_fn = SOURCE_FUNCTIONS.get(source)
+        if search_fn is None:
+            # A source is listed in config.SOURCES_ORDER but has no matching
+            # scrapers/<name>.py module wired into SOURCE_FUNCTIONS. Skip it
+            # instead of crashing the whole run — fix by either adding the
+            # module + wiring it in, or removing the name from SOURCES_ORDER.
+            log.warning(f"'{source}' is in SOURCES_ORDER but has no scraper implementation — skipping it")
+            continue
         candidates = []
         for attempt in range(config.MAX_RETRIES):
             try:
@@ -160,35 +208,94 @@ def process_item(category: str, item_name: str, barcode: str, cat_dir: Path, del
                 log.debug(f"[{source}] attempt {attempt + 1} failed for '{item_name}': {e}")
                 time.sleep(delay)
 
+        fetched_candidates[source] = candidates
         if not candidates:
             time.sleep(delay)
             continue
 
         ranked = ranked_candidates(item_name, candidates, category=category, min_score=config.MIN_MATCH_SCORE)
         if not ranked:
-            log.debug(f"[{source}] {len(candidates)} candidate(s) for '{item_name}' but none passed matching")
+            log.debug(f"[{source}] {len(candidates)} candidate(s) for '{item_name}' but none passed strict matching")
             time.sleep(delay)
             continue
 
         referer = config.REFERERS.get(source)
-        for image_url, matched_title, score in ranked[:config.MAX_DOWNLOAD_ATTEMPTS_PER_SOURCE]:
-            try:
-                saved_path = download_image(image_url, dest_stub, referer=referer)
-                return {
-                    "barcode": barcode, "category": category, "item": item_name,
-                    "status": "success", "source": source,
-                    "match_score": f"{score:.2f}", "matched_title": matched_title,
-                    "file": str(saved_path), "error": "",
-                }
-            except Exception as e:
-                last_error = f"[{source}] download failed: {e}"
-                log.debug(f"[{source}] download failed for '{item_name}' ({image_url}): {e}")
+        saved_path, matched_title, score, dl_error = _try_download_ranked(
+            ranked, dest_stub, referer, config.MAX_DOWNLOAD_ATTEMPTS_PER_SOURCE
+        )
+        if saved_path:
+            return {
+                "barcode": barcode, "category": category, "item": item_name,
+                "status": "success", "confidence": "strict", "source": source,
+                "match_score": f"{score:.2f}", "matched_title": matched_title,
+                "file": str(saved_path), "error": "",
+            }
+        if dl_error:
+            last_error = f"[{source}] {dl_error}"
 
         time.sleep(delay)
 
+    # ---- Tier 2: relaxed retry over already-fetched candidates --------
+    if config.ENABLE_RELAXED_RETRY:
+        for source in config.SOURCES_ORDER:
+            candidates = fetched_candidates.get(source) or []
+            if not candidates:
+                continue
+
+            ranked = ranked_candidates(
+                item_name, candidates, category=category, min_score=config.RELAXED_MATCH_SCORE
+            )
+            if not ranked:
+                continue
+
+            referer = config.REFERERS.get(source)
+            saved_path, matched_title, score, dl_error = _try_download_ranked(
+                ranked, dest_stub, referer, config.MAX_DOWNLOAD_ATTEMPTS_PER_SOURCE
+            )
+            if saved_path:
+                log.info(f"[RELAXED] '{item_name}' matched from {source} at score {score:.2f} (below strict threshold)")
+                return {
+                    "barcode": barcode, "category": category, "item": item_name,
+                    "status": "success", "confidence": "relaxed", "source": source,
+                    "match_score": f"{score:.2f}", "matched_title": matched_title,
+                    "file": str(saved_path), "error": "",
+                }
+            if dl_error:
+                last_error = f"[{source} relaxed] {dl_error}"
+
+    # ---- Tier 3: broad, unrestricted web search (last resort) ---------
+    if config.ENABLE_WEB_FALLBACK:
+        try:
+            candidates = duckduckgo.search_candidates(item_name)
+        except Exception as e:
+            candidates = []
+            last_error = f"[duckduckgo] search failed: {e}"
+
+        if candidates:
+            ranked = ranked_candidates(
+                item_name, candidates, category=category, min_score=config.WEB_FALLBACK_MATCH_SCORE
+            )
+            if ranked:
+                referer = config.REFERERS.get("duckduckgo")
+                saved_path, matched_title, score, dl_error = _try_download_ranked(
+                    ranked, dest_stub, referer, config.MAX_DOWNLOAD_ATTEMPTS_PER_SOURCE
+                )
+                if saved_path:
+                    log.info(f"[WEB FALLBACK] '{item_name}' matched from open web at score {score:.2f} — spot-check recommended")
+                    return {
+                        "barcode": barcode, "category": category, "item": item_name,
+                        "status": "success", "confidence": "web_fallback", "source": "duckduckgo",
+                        "match_score": f"{score:.2f}", "matched_title": matched_title,
+                        "file": str(saved_path), "error": "",
+                    }
+                if dl_error:
+                    last_error = f"[duckduckgo] {dl_error}"
+            else:
+                last_error = f"[duckduckgo] {len(candidates)} candidate(s) but none passed matching even at relaxed threshold"
+
     return {
         "barcode": barcode, "category": category, "item": item_name,
-        "status": "failed", "source": "", "match_score": "", "matched_title": "",
+        "status": "failed", "confidence": "", "source": "", "match_score": "", "matched_title": "",
         "file": "", "error": last_error,
     }
 
@@ -243,9 +350,10 @@ def main():
 
     def _log_result(result):
         score_note = f", score {result['match_score']}" if result.get("match_score") else ""
+        conf_note = f", conf={result['confidence']}" if result.get("confidence") else ""
         log.info(
             f"[{result['status'].upper()}] {result['category']} / {result['item']} "
-            f"({result['source'] or 'none'}{score_note})"
+            f"({result['source'] or 'none'}{score_note}{conf_note})"
         )
 
     if args.workers <= 1:

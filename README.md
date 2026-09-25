@@ -174,3 +174,6 @@ output/
   "no confident match" rather than a block/CAPTCHA, either the item names
   are too generic (see above) or `MIN_MATCH_SCORE` is set too strict for
   your catalog.
+
+
+<!-- 7616 -->

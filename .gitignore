@@ -2,4 +2,4 @@
 /scrapers*
 *.zip
 *.xlsx
-/_pycache_*
+/*_pycache_*
